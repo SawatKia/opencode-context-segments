@@ -21,7 +21,7 @@ No config edits needed — drop it in `plugins/context-segments/` and it auto-lo
 **Option A — clone into your plugins dir (global, auto-discovered):**
 
 ```sh
-git clone https://github.com/<you>/opencode-context-segments.git \
+git clone https://github.com/SawatKia/opencode-context-segments.git \
   ~/.config/opencode/plugins/context-segments
 ```
 
@@ -33,6 +33,36 @@ Then relaunch the TUI. Check `opencode.log` for `loading plugin ... context-segm
 {
   "plugins": [{ "package": "opencode-context-segments", "options": {} }]
 }
+```
+
+## Preview
+
+Sidebar (expanded) — header, color-segmented bar, per-segment rows:
+
+```text
+Context 24.0%(252,099) (click to collapse)
+███████───────── 24%
+■ system 20.9% (219,435)
+■ history 0.1% (1,541)
+■ tools 2.9% (30,902)
+■ assistant 0.0% (216)
+■ reasoning 0.0% (5)
+```
+
+`/context` agent-readable text output (produced by the real `renderSummaryText`):
+
+```text
+Context: 252,099 / 1,050,000 tokens (24.0% of anthropic/claude-opus-4-6)
+
+SYSTEM    █████░░░░░░░░░░░░░░░░░░░  20.9% (219,435)
+HISTORY   ░░░░░░░░░░░░░░░░░░░░░░░░   0.1% (1,541)
+TOOLS     █░░░░░░░░░░░░░░░░░░░░░░░   2.9% (30,902)
+ASSISTANT ░░░░░░░░░░░░░░░░░░░░░░░░   0.0% (216)
+REASONING ░░░░░░░░░░░░░░░░░░░░░░░░   0.0% (5)
+
+Top tools:
+- read: 18,020 tokens, 42 calls
+- shell: 9,400 tokens, 18 calls
 ```
 
 ## How the numbers work (lightweight, no downloads)
