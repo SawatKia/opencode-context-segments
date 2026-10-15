@@ -235,7 +235,7 @@ async function load() {
     }
     const totals = summary.toolTotals || {};
     document.getElementById("tooltotals").textContent = "By source: " +
-      Object.keys(totals).map(function (k) { return k + " " + fmt(totals[k].tokens) + "/" + totals[k].calls + " calls"; }).join(" · ");
+      Object.keys(totals).filter(function (k) { return totals[k].tokens > 0 || totals[k].calls > 0; }).map(function (k) { return k + " " + fmt(totals[k].tokens) + "/" + totals[k].calls + " calls"; }).join(" · ");
     const detailsBody = document.getElementById("detailsbody");
     detailsBody.innerHTML = "";
     const topDetails = summary.topDetails || [];

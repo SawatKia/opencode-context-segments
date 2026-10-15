@@ -76,7 +76,7 @@ Loaded details (heaviest individual loads — what exactly to skip next time):
 
 ## How the numbers work (lightweight, no downloads)
 
-1. Visible transcript text is bucketed per segment and rough-counted (`ceil(chars / 4)`). Base64 file attachments and tool file URIs are skipped — only human-readable text counts.
+1. Visible transcript text is bucketed per segment and rough-counted (`ceil(chars / 4)`). Base64 file attachments and tool file URIs are skipped — only human-readable text counts. `system` entries that are actually instruction injections are re-attributed by `description`/content: the skills catalog → `skills`, the Code Mode tool catalog → `mcps`, AGENTS.md/CLAUDE.md-style entries → `rules`. Compaction `summary` + `recent` both count toward `history`, and each tool call's name + input counts toward `assistant` so tool-heavy turns don't show ~0 output.
 2. When the newest assistant message carries server telemetry (`input / output / reasoning / cache.read / cache.write`), prompt-side buckets are scaled to `input + cache` and assistant/reasoning to `output / reasoning` — the same idea as IgorWarzocha's `Opencode-Context-Analysis-Plugin`, without its `vendor/` tokenizer downloads.
 3. Headline `%` = scaled usage ÷ model `limit.context`. Unknown limit shows absolute tokens with no fake percentage.
 

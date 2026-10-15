@@ -455,6 +455,15 @@ function SegmentDetails(props: { summary: Summary; hot?: boolean }) {
   );
 }
 
+/** Shorten overflow-prone detail labels for narrow TUI columns: keep the
+ *  tail of paths (the filename matters) and the head of commands. */
+function shortLabel(label: string, max = 100): string {
+  if (label.length <= max) return label;
+  return label.includes("/") || label.includes("\\")
+    ? `…${label.slice(-(max - 1))}`
+    : `${label.slice(0, max - 1)}…`;
+}
+
 /** Full breakdown body driven by already-loaded data (never fetches).
  *  Rendered by the session panel (after its fetch) and by the footer
  *  dialog (reusing the footer's data, so it can't get stuck loading). */
@@ -494,7 +503,7 @@ function DetailBody(props: { summary: Summary; onClose?: () => void }) {
       <Show when={s().toolTotals} fallback={null}>
         {(totals) => (
           <text fg={theme.text?.muted as never}>
-            {`Tools by source: ${(Object.keys(totals()) as ToolCategory[]).map((cat) => `${cat} ${formatNumber(totals()[cat].tokens)}/${totals()[cat].calls} calls`).join(" · ")}`}
+            {`Tools by source: ${(Object.keys(totals()) as ToolCategory[]).filter((cat) => totals()[cat].tokens > 0 || totals()[cat].calls > 0).map((cat) => `${cat} ${formatNumber(totals()[cat].tokens)}/${totals()[cat].calls} calls`).join(" · ")}`}
           </text>
         )}
       </Show>
@@ -513,7 +522,7 @@ function DetailBody(props: { summary: Summary; onClose?: () => void }) {
         <For each={s().topDetails ?? []}>
           {(d) => (
             <text fg={theme.text?.muted as never}>
-              {`${d.name}${d.category ? ` [${d.category}]` : ""} ${d.label}: ${formatNumber(d.tokens)} tokens, ${d.calls} calls`}
+              {`${d.name}${d.category ? ` [${d.category}]` : ""} ${shortLabel(d.label)}: ${formatNumber(d.tokens)} tokens, ${d.calls} calls`}
             </text>
           )}
         </For>

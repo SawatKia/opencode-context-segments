@@ -95,6 +95,34 @@ const RULE_FILE_RE =
   /(^|[/\\])(agents|claude|gemini)(\.md)?\b|[/\\]\.cursor[/\\]rules[/\\]|[/\\]\.opencode[/\\]|(^|[/\\])instructions?[/\\]|\.cursorrules\b/i;
 const SKILL_FILE_RE = /skill\.md\b/i;
 
+const SKILLS_CATALOG_RE = /available skills have changed|<available_skills>/i;
+const TOOL_CATALOG_RE = /# Code Mode|tool catalog has changed/i;
+
+/**
+ * Where a `system` context entry really belongs. OpenCode injects
+ * instruction blocks (skills catalog, tool catalog) as `type: "system"`
+ * messages tagged `description: "Instructions updated: …"` — leaving
+ * them all in `system` hides what's actually eating context, so the
+ * skills catalog folds into `skills` and the tool catalog into `mcps`.
+ */
+function systemBucket(
+  msg: Record<string, unknown>,
+): "system" | "skills" | "mcps" | "rules" {
+  const desc = typeof msg.description === "string" ? msg.description : "";
+  const text = typeof msg.text === "string" ? msg.text.slice(0, 2000) : "";
+  if (/skill-guidance/i.test(desc) || SKILLS_CATALOG_RE.test(text))
+    return "skills";
+  if (
+    /mcp-guidance/i.test(desc) ||
+    /codemode/i.test(desc) ||
+    TOOL_CATALOG_RE.test(text)
+  )
+    return "mcps";
+  if (/agents|claude\.md|gemini|instructions?|rules|\.cursorrules/i.test(desc))
+    return "rules";
+  return "system";
+}
+
 function asStringList(value: unknown): string[] {
   if (!value) return [];
   if (typeof value === "string") return [value];
@@ -493,7 +521,10 @@ export function summarize(
         break;
       }
       case "system": {
-        buckets.system += estimateTokens(msg.text);
+        // Most `system` entries are instruction injections (skills
+        // catalog, tool catalog), not the base prompt — attribute them
+        // so the bar shows what's actually loaded.
+        buckets[systemBucket(msg)] += estimateTokens(msg.text);
         break;
       }
       case "synthetic": {
@@ -523,10 +554,12 @@ export function summarize(
         break;
       }
       case "compaction": {
-        // msg.summary is the compacted-away history in one line.
-        buckets.history += estimateTokens(
-          (msg as { summary?: unknown }).summary,
-        );
+        // Compacted-away history: `summary` plus `recent` together
+        // replace the pre-compaction transcript. Counting only the
+        // summary starves history after every compaction.
+        const c = msg as { summary?: unknown; recent?: unknown };
+        buckets.history +=
+          estimateTokens(c.summary) + estimateTokens(c.recent);
         break;
       }
       case "instruction":
@@ -571,6 +604,11 @@ export function summarize(
               // into rules; everything else keeps its own segment.
               if (cat === "skills") buckets.skills += tokens;
               else buckets[cat] += tokens;
+              // The call itself (name + input JSON) is model output tokens.
+              // Without this, tool-heavy turns show ~0 assistant output.
+              buckets.assistant += estimateTokens(
+                `${name} ${argsText(p)}`.slice(0, 2000),
+              );
               addTool(name, tokens, cat, p);
               const label = toolLabel(name, p);
               if (label) addDetail(name, label, tokens, cat);
@@ -633,13 +671,19 @@ export function summarize(
     } else if (promptActual <= 0) {
       for (const key of PROMPT_KEYS) buckets[key] = 0;
     }
-    if (latestTelemetry.output > 0 && buckets.assistant > 0) {
+    if (latestTelemetry.output > 0 && (buckets.assistant > 0 || steps > 0)) {
+      // Fall back to server truth when the transcript carries no text
+      // (e.g. a pure tool-call turn): output tokens are real even when
+      // our text estimate is 0.
       buckets.assistant = latestTelemetry.output;
       estimated = false;
     } else if (latestTelemetry.output <= 0) {
       buckets.assistant = 0;
     }
-    if (latestTelemetry.reasoning > 0 && buckets.reasoning > 0) {
+    if (
+      latestTelemetry.reasoning > 0 &&
+      (buckets.reasoning > 0 || steps > 0)
+    ) {
       buckets.reasoning = latestTelemetry.reasoning;
       estimated = false;
     } else if (latestTelemetry.reasoning <= 0) {
@@ -776,6 +820,10 @@ export function renderSummaryText(summary: SummaryResult): string {
   }
   if (summary.toolTotals) {
     const parts = (Object.keys(summary.toolTotals) as ToolCategory[])
+      .filter((cat) => {
+        const t = summary.toolTotals[cat];
+        return t.tokens > 0 || t.calls > 0;
+      })
       .map((cat) => {
         const t = summary.toolTotals[cat];
         return `${cat} ${formatNumber(t.tokens)} tokens/${t.calls} calls`;
