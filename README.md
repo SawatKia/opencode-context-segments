@@ -7,10 +7,10 @@ No config edits needed — drop it in `plugins/context-segments/` and it auto-lo
 ## What you get
 
 - **Colorized context bar** — each LLM's `limit.context` is 100%.
-  Segments: `system` · `skills` · `history` · `tools` · `assistant` · `reasoning` (theme-aware colors, never text-only). Warns at 70–90%, critical above 90%.
+  Segments: `system` · `skills` · `history` · `mcps` · `rules` · `others` · `assistant` · `reasoning` (theme-aware colors, never text-only). Warns at 70–90%, critical above 90%.
 - **Compact mode** (sidebar hidden): bar lives in the prompt footer. The whole row is clickable — opens the breakdown dialog instantly (no second fetch). `[esc]` top-right or click-outside to dismiss.
 - **Full mode** (sidebar visible): breakdown section appended to the sidebar. Native readout untouched. Horizontal bar on top, per-segment rows beneath (each led by a swatch in its bar color), expanded by default, header shows `{pct}%({used})`. Click anywhere to collapse/expand; hover lightens.
-- **`/cseg`** — session breakdown panel (per-segment table, top tools, top skills, compaction warning).
+- **`/cseg`** — session breakdown panel (per-segment table, top tools, top skills, heaviest individual loads, compaction warning).
 - **`/cseg-skills`** — skill-usage stats in the terminal, or `/cseg-skills web` for the loopback CSS dashboard (auto-closes when the tab closes).
 - **`/context`** — post the breakdown into the session (agent-readable).
 - **`/context-skills`** — post skill stats into the session.
@@ -44,7 +44,8 @@ Context 24.0%(252,099) (click to collapse)
 ███████───────── 24%
 ■ system 20.9% (219,435)
 ■ history 0.1% (1,541)
-■ tools 2.9% (30,902)
+■ mcps 2.0% (21,502)
+■ others 0.9% (9,400)
 ■ assistant 0.0% (216)
 ■ reasoning 0.0% (5)
 ```
@@ -56,13 +57,21 @@ Context: 252,099 / 1,050,000 tokens (24.0% of anthropic/claude-opus-4-6)
 
 SYSTEM    █████░░░░░░░░░░░░░░░░░░░  20.9% (219,435)
 HISTORY   ░░░░░░░░░░░░░░░░░░░░░░░░   0.1% (1,541)
-TOOLS     █░░░░░░░░░░░░░░░░░░░░░░░   2.9% (30,902)
+MCPS      ░░░░░░░░░░░░░░░░░░░░░░░░   2.0% (21,502)
+OTHERS    ░░░░░░░░░░░░░░░░░░░░░░░░   0.9% (9,400)
 ASSISTANT ░░░░░░░░░░░░░░░░░░░░░░░░   0.0% (216)
 REASONING ░░░░░░░░░░░░░░░░░░░░░░░░   0.0% (5)
 
-Top tools:
-- read: 18,020 tokens, 42 calls
-- shell: 9,400 tokens, 18 calls
+Top tools (registry-classified):
+- read [others]: 18,020 tokens, 42 calls
+- shell [others]: 9,400 tokens, 18 calls
+
+Skills this session (`skill`-tool loads + `SKILL.md` reads are named):
+- pdf: 1,240 tokens, 3x
+
+Loaded details (heaviest individual loads — what exactly to skip next time):
+- read [others] C:/proj/src/big.ts: 9,100 tokens, 2 calls
+- read [skills] skill:pdf: 1,240 tokens, 3 calls
 ```
 
 ## How the numbers work (lightweight, no downloads)

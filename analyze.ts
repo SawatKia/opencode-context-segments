@@ -7,7 +7,8 @@
  *
  * Method (lightweight, per approved plan — no vendor tokenizers):
  *  1. Bucket visible transcript text into segments:
- *     system / skills / history(user) / tools / assistant / reasoning.
+ *     system / skills / history(user) / mcps / rules / others /
+ *     assistant / reasoning.
  *     NOTE: user file attachments (base64) and tool file contents (URIs)
  *     are deliberately skipped — only human-readable text is counted.
  *  2. Rough-count with ceil(chars / 4).
@@ -30,10 +31,229 @@ export const SEGMENT_META: SegmentMeta[] = [
   { key: "system", label: "system", color: "#8b8fa3" },
   { key: "skills", label: "skills", color: "#a78bfa" },
   { key: "history", label: "history", color: "#60a5fa" },
-  { key: "tools", label: "tools", color: "#fbbf24" },
+  { key: "mcps", label: "mcps", color: "#fbbf24" },
+  { key: "rules", label: "rules", color: "#2dd4bf" },
+  { key: "others", label: "others", color: "#fb7185" },
   { key: "assistant", label: "assistant", color: "#34d399" },
   { key: "reasoning", label: "reasoning", color: "#f472b6" },
 ];
+
+/**
+ * Sub-categories of the old single `tools` bucket. Every tool output lands
+ * in exactly one of these; their sum equals the old `tools` total.
+ *
+ * - `skills`: the native `skill` tool (skill-content loads) and reads of
+ *   `SKILL.md` files. Skill *activations* (`type: "skill"` messages) also
+ *   live in the top-level `skills` segment.
+ * - `mcps`: tools served by an MCP server (exact registry match first,
+ *   `<server>_<tool>` prefix heuristic as fallback).
+ * - `rules`: tool calls that load rule/instruction files (`AGENTS.md`,
+ *   `CLAUDE.md`, `.cursor/rules/`, …) plus `instruction`/`rule` session
+ *   messages. Ambient rules baked into the system prompt cannot be split
+ *   from the transcript alone, so this is a lower bound — the rest stays
+ *   in `system`.
+ * - `others`: built-in tools (`read`, `edit`, `bash`, …), custom tools,
+ *   `shell` messages, and anything unclassifiable.
+ */
+export type ToolCategory = "skills" | "mcps" | "rules" | "others";
+
+export const TOOL_CATEGORIES: ToolCategory[] = [
+  "skills",
+  "mcps",
+  "rules",
+  "others",
+];
+
+/** Registry-derived ground truth for exact classification. */
+export interface ToolClassifier {
+  /** MCP server names from `ctx.mcp.list()` (e.g. `["context7"]`). */
+  mcpServers?: unknown;
+  /** Exact MCP tool ids from `ctx.tool.list()` when available. */
+  mcpTools?: unknown;
+}
+
+/** Built-in OpenCode tools — never MCPs, never skills. */
+const BUILTIN_TOOLS = new Set([
+  "bash",
+  "shell",
+  "edit",
+  "write",
+  "read",
+  "grep",
+  "glob",
+  "lsp",
+  "apply_patch",
+  "skill",
+  "webfetch",
+  "websearch",
+  "question",
+]);
+
+const MCP_ID_RE = /^mcp[_-]{1,2}.+/i;
+const MCP_WRAPPED_RE = /^mcp__.+__.+$/i;
+const RULE_FILE_RE =
+  /(^|[/\\])(agents|claude|gemini)(\.md)?\b|[/\\]\.cursor[/\\]rules[/\\]|[/\\]\.opencode[/\\]|(^|[/\\])instructions?[/\\]|\.cursorrules\b/i;
+const SKILL_FILE_RE = /skill\.md\b/i;
+
+function asStringList(value: unknown): string[] {
+  if (!value) return [];
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) {
+    return value.filter((v): v is string => typeof v === "string");
+  }
+  if (value instanceof Set) {
+    return [...value].filter((v): v is string => typeof v === "string");
+  }
+  return [];
+}
+
+/** Normalize for prefix comparison: dots/dashes become `_`, lowercase. */
+function normId(value: string): string {
+  return value.trim().toLowerCase().replace(/[.-]/g, "_");
+}
+
+/** Best-effort file-path text from a tool part's input/args fields. */
+function argsText(part: Record<string, unknown>): string {
+  const candidates = [
+    part.input,
+    part.args,
+    (part.state as Record<string, unknown> | undefined)?.input,
+    (part.state as Record<string, unknown> | undefined)?.args,
+  ];
+  const out: string[] = [];
+  for (const c of candidates) {
+    if (typeof c === "string") {
+      if (c.length <= 2000) out.push(c);
+    } else if (c && typeof c === "object") {
+      try {
+        out.push(JSON.stringify(c).slice(0, 2000));
+      } catch {
+        // ignore unstringifiable args
+      }
+    }
+  }
+  return out.join("\n");
+}
+
+/** Parsed args/input object of a tool part, when available. */
+function partArgs(part: Record<string, unknown>): Record<string, unknown> {
+  const candidates = [
+    part.input,
+    part.args,
+    (part.state as Record<string, unknown> | undefined)?.input,
+    (part.state as Record<string, unknown> | undefined)?.args,
+  ];
+  for (const c of candidates) {
+    if (c && typeof c === "object" && !Array.isArray(c)) {
+      return c as Record<string, unknown>;
+    }
+  }
+  return {};
+}
+
+function firstString(...values: unknown[]): string {
+  for (const v of values) {
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
+/**
+ * Short human label for one tool call — file path, command, URL, query,
+ * or skill name — so the breakdown can show *what* was loaded, not just
+ * which tool ran. Returns "" when nothing useful is present.
+ */
+export function toolLabel(name: string, part?: Record<string, unknown>): string {
+  if (!part) return "";
+  const args = partArgs(part);
+  if (name.toLowerCase() === "skill") {
+    return firstString(args.skill, args.name, args.id);
+  }
+  const file = firstString(
+    args.filePath,
+    args.path,
+    args.file,
+    args.filename,
+    args.uri,
+  );
+  if (file) {
+    const skill = skillNameFromPath(file);
+    if (skill) return `skill:${skill}`;
+    return file.length > 120 ? `…${file.slice(-119)}` : file;
+  }
+  const hint = firstString(
+    args.command,
+    args.cmd,
+    args.url,
+    args.query,
+    args.pattern,
+    args.text,
+  );
+  if (hint) {
+    const oneLine = hint.replace(/\s+/g, " ");
+    return oneLine.length > 100 ? `${oneLine.slice(0, 99)}…` : oneLine;
+  }
+  return "";
+}
+
+/** Owning skill name of a `.../<name>/SKILL.md` path, or "". */
+export function skillNameFromPath(file: string): string {
+  const m = /([^/\\]+)[/\\]SKILL\.md$/i.exec(file);
+  return m ? m[1] : "";
+}
+
+export function classifyTool(
+  name: unknown,
+  classifier?: ToolClassifier,
+  part?: Record<string, unknown>,
+): ToolCategory {
+  const raw = typeof name === "string" ? name.trim() : "";
+  if (!raw) return "others";
+  const lower = raw.toLowerCase();
+  if (lower === "skill") return "skills";
+
+  const servers = asStringList(classifier?.mcpServers)
+    .map((s) => normId(s))
+    .filter(Boolean);
+  const tools = new Set(
+    asStringList(classifier?.mcpTools).map((t) => normId(t)),
+  );
+  const nid = normId(raw);
+
+  // 1. Exact registry matches win over every heuristic.
+  if (tools.has(nid)) return "mcps";
+  for (const server of servers) {
+    if (
+      nid === server ||
+      nid.startsWith(`${server}_`) ||
+      nid.startsWith(`mcp__${server}__`)
+    ) {
+      return "mcps";
+    }
+  }
+
+  // 2. File-path hints beat name guessing (rule/skill file reads).
+  if (part) {
+    const hint = argsText(part);
+    if (hint) {
+      if (SKILL_FILE_RE.test(hint)) return "skills";
+      if (RULE_FILE_RE.test(hint)) return "rules";
+    }
+  }
+
+  // 3. Name heuristics — only trusted when the registry gave us nothing
+  //    to match against (no servers and no tool ids). With a registry,
+  //    an unmatched name is `others`, not a guessed MCP.
+  const hasRegistry = servers.length > 0 || tools.size > 0;
+  if (!hasRegistry) {
+    if (MCP_WRAPPED_RE.test(raw) || MCP_ID_RE.test(raw)) return "mcps";
+    const head = nid.split("_")[0].split("-")[0];
+    if ((raw.includes("_") || raw.includes("-")) && !BUILTIN_TOOLS.has(head)) {
+      return "mcps";
+    }
+  }
+  return "others";
+}
 
 export interface SegmentDatum {
   key: string;
@@ -50,6 +270,7 @@ export interface ToolDatum {
   name: string;
   tokens: number;
   calls: number;
+  category: ToolCategory;
 }
 
 export interface SkillDatum {
@@ -57,6 +278,16 @@ export interface SkillDatum {
   name: string;
   tokens: number;
   count: number;
+}
+
+/** One loaded item: which tool call pulled what into context. */
+export interface ToolDetailDatum {
+  name: string;
+  /** File path, command, URL, query, or `skill:<name>`. */
+  label: string;
+  tokens: number;
+  calls: number;
+  category: ToolCategory;
 }
 
 export interface WarnDatum {
@@ -83,6 +314,14 @@ export interface SummaryResult {
   topTools: ToolDatum[];
   /** Skills observed in this session's transcript. */
   topSkills: SkillDatum[];
+  /** Heaviest individual loads: what exactly was pulled in (top 12). */
+  topDetails: ToolDetailDatum[];
+  /** Per-category tool leaders (top 5 each, tokens desc). */
+  topByCategory: Record<ToolCategory, ToolDatum[]>;
+  /** Token/call totals per tool category. */
+  toolTotals: Record<ToolCategory, { tokens: number; calls: number }>;
+  /** Whether MCP attribution used the live registry or name heuristics. */
+  classifierSource: "registry" | "heuristic";
   counts: { messages: number; steps: number };
   warn: WarnDatum | null;
   /** True when no server telemetry was available (pure estimates). */
@@ -98,6 +337,8 @@ export interface SummarizeOptions {
   sessionTokens?: unknown;
   warnAt?: number;
   criticalAt?: number;
+  /** Registry-derived MCP ground truth; omitted => pure name heuristics. */
+  classifier?: ToolClassifier;
 }
 
 export function estimateTokens(text: unknown): number {
@@ -158,21 +399,51 @@ export function summarize(
     system: 0,
     skills: 0,
     history: 0,
-    tools: 0,
+    mcps: 0,
+    rules: 0,
+    others: 0,
     assistant: 0,
     reasoning: 0,
   };
-  const tools = new Map<string, { tokens: number; calls: number }>();
+  const tools = new Map<
+    string,
+    { name: string; tokens: number; calls: number; category: ToolCategory }
+  >();
   const skills = new Map<string, { name: string; tokens: number; count: number }>();
   let steps = 0;
   let latestTelemetry: TokenTotals | null = null;
 
-  const addTool = (name: string, tokens: number) => {
-    const key = name || "tool";
-    const entry = tools.get(key) ?? { tokens: 0, calls: 0 };
+  const classifier = opts.classifier;
+  const classifierSource: "registry" | "heuristic" =
+    asStringList(classifier?.mcpServers).length > 0 ||
+    asStringList(classifier?.mcpTools).length > 0
+      ? "registry"
+      : "heuristic";
+
+  const addTool = (
+    name: string,
+    tokens: number,
+    category?: ToolCategory,
+    part?: Record<string, unknown>,
+  ) => {
+    const base = name || "tool";
+    // Classify late when the caller did not: shell messages and other
+    // non-part call sites pass no category of their own.
+    const cat = category ?? classifyTool(base, classifier, part);
+    // Key by category: the same tool (e.g. `read`) can load skill files
+    // (skills) and normal files (others) — collapsing them under one row
+    // would misattribute tokens in toolTotals.
+    const key = `${cat}|${base}`;
+    const entry = tools.get(key) ?? {
+      tokens: 0,
+      calls: 0,
+      category: cat,
+      name: base,
+    };
     entry.tokens += tokens;
     entry.calls += 1;
     tools.set(key, entry);
+    return cat;
   };
 
   const addSkill = (id: string, name: string, tokens: number) => {
@@ -181,6 +452,36 @@ export function summarize(
     entry.tokens += tokens;
     entry.count += 1;
     skills.set(key, entry);
+  };
+
+  const details = new Map<
+    string,
+    {
+      name: string;
+      label: string;
+      tokens: number;
+      calls: number;
+      category: ToolCategory;
+    }
+  >();
+  const addDetail = (
+    name: string,
+    label: string,
+    tokens: number,
+    category: ToolCategory,
+  ) => {
+    if (!label || tokens <= 0) return;
+    const key = `${category}|${name}|${label}`;
+    const entry = details.get(key) ?? {
+      name,
+      label,
+      tokens: 0,
+      calls: 0,
+      category,
+    };
+    entry.tokens += tokens;
+    entry.calls += 1;
+    details.set(key, entry);
   };
 
   for (const raw of list) {
@@ -210,14 +511,35 @@ export function summarize(
       case "shell": {
         const output = msg.output as { output?: unknown } | undefined;
         const tokens = estimateTokens(output?.output);
-        buckets.tools += tokens;
-        if (tokens > 0) addTool("shell", tokens);
+        buckets.others += tokens;
+        if (tokens > 0) {
+          addTool("shell", tokens, "others");
+          const cmd =
+            typeof (msg as { command?: unknown }).command === "string"
+              ? (msg as { command?: string }).command
+              : "";
+          addDetail("shell", cmd || "shell", tokens, "others");
+        }
         break;
       }
       case "compaction": {
         // msg.summary is the compacted-away history in one line.
         buckets.history += estimateTokens(
           (msg as { summary?: unknown }).summary,
+        );
+        break;
+      }
+      case "instruction":
+      case "instructions":
+      case "rule":
+      case "rules": {
+        // Session instruction entries (AGENTS.md updates, configured
+        // instructions) — the only rules text separable from the
+        // transcript. Ambient rules baked into the system prompt stay
+        // in `system`, so this segment is a lower bound.
+        buckets.rules += estimateTokens(
+          (msg as { text?: unknown }).text ??
+            (msg as { content?: unknown }).content,
         );
         break;
       }
@@ -242,8 +564,24 @@ export function summarize(
                   (state as { content?: unknown }).content,
                 ),
               );
-              buckets.tools += tokens;
-              addTool(String(p.name ?? "tool"), tokens);
+              const name = String(p.name ?? "tool");
+              const cat = classifyTool(name, classifier, p);
+              // `skill`-tool loads and SKILL.md reads fold into the skills
+              // segment alongside skill activations; rule-file reads fold
+              // into rules; everything else keeps its own segment.
+              if (cat === "skills") buckets.skills += tokens;
+              else buckets[cat] += tokens;
+              addTool(name, tokens, cat, p);
+              const label = toolLabel(name, p);
+              if (label) addDetail(name, label, tokens, cat);
+              // Name skill loads so "Skills this session" identifies them
+              // instead of showing a bare `skill` tool row.
+              if (name.toLowerCase() === "skill") {
+                if (label) addSkill(label, label, tokens);
+              } else if (label.startsWith("skill:")) {
+                const skillName = label.slice("skill:".length);
+                if (skillName) addSkill(skillName, skillName, tokens);
+              }
             }
           }
         }
@@ -255,37 +593,45 @@ export function summarize(
     }
   }
 
-  // Scale estimates to server telemetry when available.
+  // Prompt-side buckets scale to input+cache; the old single `tools`
+  // bucket is now three segments (mcps/rules/others) — the `skills`
+  // segment already includes skill-tool outputs folded in above.
+  const PROMPT_KEYS = [
+    "system",
+    "skills",
+    "history",
+    "mcps",
+    "rules",
+    "others",
+  ] as const;
   let estimated = true;
   if (latestTelemetry) {
-    const promptMeasured =
-      buckets.system + buckets.skills + buckets.history + buckets.tools;
+    const promptMeasured = PROMPT_KEYS.reduce(
+      (sum, key) => sum + buckets[key],
+      0,
+    );
     const promptActual =
       latestTelemetry.input +
       latestTelemetry.cacheRead +
       latestTelemetry.cacheWrite;
     if (promptActual > 0 && promptMeasured > 0) {
       const factor = promptActual / promptMeasured;
-      for (const key of ["system", "skills", "history", "tools"]) {
+      for (const key of PROMPT_KEYS) {
         buckets[key] = Math.round(buckets[key] * factor);
       }
       // Fix rounding drift on the largest prompt bucket.
-      const keys = ["system", "skills", "history", "tools"] as const;
-      const scaled = keys.reduce((sum, key) => sum + buckets[key], 0);
+      const scaled = PROMPT_KEYS.reduce((sum, key) => sum + buckets[key], 0);
       const drift = Math.round(promptActual - scaled);
       if (drift !== 0) {
-        let biggest: (typeof keys)[number] = "history";
-        for (const key of keys) {
+        let biggest: (typeof PROMPT_KEYS)[number] = "history";
+        for (const key of PROMPT_KEYS) {
           if (buckets[key] > buckets[biggest]) biggest = key;
         }
         buckets[biggest] += drift;
       }
       estimated = false;
     } else if (promptActual <= 0) {
-      buckets.system = 0;
-      buckets.skills = 0;
-      buckets.history = 0;
-      buckets.tools = 0;
+      for (const key of PROMPT_KEYS) buckets[key] = 0;
     }
     if (latestTelemetry.output > 0 && buckets.assistant > 0) {
       buckets.assistant = latestTelemetry.output;
@@ -313,10 +659,33 @@ export function summarize(
     pctOfUsed: used > 0 ? (buckets[meta.key] / used) * 100 : 0,
   }));
 
-  const topTools: ToolDatum[] = [...tools.entries()]
-    .map(([name, entry]) => ({ name, tokens: entry.tokens, calls: entry.calls }))
-    .sort((a, b) => b.tokens - a.tokens)
-    .slice(0, 5);
+  const rankedTools: ToolDatum[] = [...tools.values()]
+    .map((entry) => ({
+      name: entry.name,
+      tokens: entry.tokens,
+      calls: entry.calls,
+      category: entry.category,
+    }))
+    .sort((a, b) => b.tokens - a.tokens);
+  const topTools: ToolDatum[] = rankedTools.slice(0, 5);
+  const topByCategory = Object.fromEntries(
+    TOOL_CATEGORIES.map((cat) => [
+      cat,
+      rankedTools.filter((t) => t.category === cat).slice(0, 5),
+    ]),
+  ) as Record<ToolCategory, ToolDatum[]>;
+  const toolTotals = Object.fromEntries(
+    TOOL_CATEGORIES.map((cat) => {
+      const inCat = rankedTools.filter((t) => t.category === cat);
+      return [
+        cat,
+        {
+          tokens: inCat.reduce((sum, t) => sum + t.tokens, 0),
+          calls: inCat.reduce((sum, t) => sum + t.calls, 0),
+        },
+      ];
+    }),
+  ) as Record<ToolCategory, { tokens: number; calls: number }>;
 
   const topSkills: SkillDatum[] = [...skills.values()]
     .map((entry) => ({
@@ -327,6 +696,10 @@ export function summarize(
     }))
     .sort((a, b) => b.tokens - a.tokens)
     .slice(0, 5);
+
+  const topDetails: ToolDetailDatum[] = [...details.values()]
+    .sort((a, b) => b.tokens - a.tokens)
+    .slice(0, 12);
 
   let warn: WarnDatum | null = null;
   if (pct !== null) {
@@ -351,6 +724,10 @@ export function summarize(
     segments,
     topTools,
     topSkills,
+    topDetails,
+    topByCategory,
+    toolTotals,
+    classifierSource,
     counts: { messages: list.length, steps },
     warn,
     estimated,
@@ -390,16 +767,35 @@ export function renderSummaryText(summary: SummaryResult): string {
   }
   if (summary.topTools.length > 0) {
     lines.push("");
-    lines.push("Top tools:");
+    lines.push(
+      `Top tools (${summary.classifierSource === "registry" ? "registry-classified" : "name-heuristic; registry unavailable"}):`,
+    );
     for (const tool of summary.topTools) {
-      lines.push(`- ${tool.name}: ${formatNumber(tool.tokens)} tokens, ${tool.calls} calls`);
+      lines.push(`- ${tool.name} [${tool.category}]: ${formatNumber(tool.tokens)} tokens, ${tool.calls} calls`);
     }
+  }
+  if (summary.toolTotals) {
+    const parts = (Object.keys(summary.toolTotals) as ToolCategory[])
+      .map((cat) => {
+        const t = summary.toolTotals[cat];
+        return `${cat} ${formatNumber(t.tokens)} tokens/${t.calls} calls`;
+      })
+      .join(" · ");
+    lines.push("");
+    lines.push(`Tools by source: ${parts}`);
   }
   if (summary.topSkills.length > 0) {
     lines.push("");
     lines.push("Skills this session:");
     for (const skill of summary.topSkills) {
       lines.push(`- ${skill.name}: ${formatNumber(skill.tokens)} tokens, ${skill.count}x`);
+    }
+  }
+  if (summary.topDetails.length > 0) {
+    lines.push("");
+    lines.push("Loaded details (heaviest individual loads):");
+    for (const d of summary.topDetails) {
+      lines.push(`- ${d.name} [${d.category}] ${d.label}: ${formatNumber(d.tokens)} tokens, ${d.calls} calls`);
     }
   }
   if (summary.warn) {

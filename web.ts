@@ -49,18 +49,37 @@ export function dashboardRunning(): Handle | null {
 }
 
 export function stopDashboard(): boolean {
-  if (!current) return false;
-  try {
-    clearInterval(current.timer);
-  } catch {
-    // ignore
-  }
-  try {
-    current.server.close();
-  } catch {
-    // ignore
-  }
+  // Null first: a concurrent startDashboard() must build a fresh server
+  // instead of grabbing a handle we are about to close.
+  const cur = current;
   current = null;
+  if (!cur) return false;
+  try {
+    clearInterval(cur.timer);
+  } catch {
+    // ignore
+  }
+  try {
+    // close() alone waits for keep-alive/heartbeat sockets; drop them so
+    // stop() never hangs the plugin unload path.
+    const srv = cur.server as unknown as {
+      closeAllConnections?: () => void;
+      closeIdleConnections?: () => void;
+    };
+    try {
+      srv.closeAllConnections?.();
+    } catch {
+      // older runtimes lack it — fall through to close()
+    }
+    try {
+      srv.closeIdleConnections?.();
+    } catch {
+      // ignore
+    }
+    cur.server.close();
+  } catch {
+    // ignore
+  }
   return true;
 }
 
@@ -123,6 +142,13 @@ footer { color: #5b6172; font-size: 11px; margin-top: 8px; }
 <div class="bar" id="bar"></div>
 <div id="segs"></div>
 <div id="warn"></div>
+</section>
+<section id="tools" hidden>
+<h2>Top tools <span id="clfsrc" style="text-transform:none"></span></h2>
+<table><thead><tr><th>Tool</th><th>Source</th><th>Tokens</th><th>Calls</th></tr></thead><tbody id="toolsbody"></tbody></table>
+<p class="sub" id="tooltotals"></p>
+<h2 style="margin-top:16px">Loaded details</h2>
+<table><thead><tr><th>Tool</th><th>What was loaded</th><th>Tokens</th><th>Calls</th></tr></thead><tbody id="detailsbody"></tbody></table>
 </section>
 <section>
 <h2>Skill usage (all sessions)</h2>
@@ -188,6 +214,44 @@ async function load() {
     row.children[3].textContent = pct;
     segs.appendChild(row);
   }
+  const toolsSec = document.getElementById("tools");
+  const toolsBody = document.getElementById("toolsbody");
+  const clf = document.getElementById("clfsrc");
+  toolsBody.innerHTML = "";
+  const topTools = summary.topTools || [];
+  if (topTools.length === 0) { toolsSec.hidden = true; }
+  else {
+    toolsSec.hidden = false;
+    clf.textContent = summary.classifierSource === "registry" ? "(registry-classified)"
+      : summary.classifierSource === "heuristic" ? "(name-heuristic; registry unavailable)" : "";
+    for (const t of topTools.slice(0, 10)) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = "<td></td><td></td><td></td><td></td>";
+      tr.children[0].textContent = t.name;
+      tr.children[1].textContent = t.category || "—";
+      tr.children[2].textContent = fmt(t.tokens);
+      tr.children[3].textContent = t.calls;
+      toolsBody.appendChild(tr);
+    }
+    const totals = summary.toolTotals || {};
+    document.getElementById("tooltotals").textContent = "By source: " +
+      Object.keys(totals).map(function (k) { return k + " " + fmt(totals[k].tokens) + "/" + totals[k].calls + " calls"; }).join(" · ");
+    const detailsBody = document.getElementById("detailsbody");
+    detailsBody.innerHTML = "";
+    const topDetails = summary.topDetails || [];
+    if (topDetails.length === 0) {
+      detailsBody.innerHTML = '<tr><td colspan="4">No itemized loads recorded.</td></tr>';
+    }
+    for (const d of topDetails.slice(0, 12)) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = "<td></td><td></td><td></td><td></td>";
+      tr.children[0].textContent = d.name + (d.category ? " [" + d.category + "]" : "");
+      tr.children[1].textContent = d.label;
+      tr.children[2].textContent = fmt(d.tokens);
+      tr.children[3].textContent = d.calls;
+      detailsBody.appendChild(tr);
+    }
+  }
   const warn = document.getElementById("warn");
   warn.innerHTML = "";
   if (summary.warn) {
@@ -213,7 +277,12 @@ export async function startDashboard(
   callbacks: DashboardCallbacks,
 ): Promise<Handle> {
   if (current) return current.handle;
-  const idleMs = callbacks.idleMs ?? 5 * 60 * 1000;
+  // Clamp the idle window: a zero/negative value would kill the server
+  // immediately, an absurd one would leak it for days.
+  const rawIdle = callbacks.idleMs ?? 5 * 60 * 1000;
+  const idleMs = Number.isFinite(rawIdle)
+    ? Math.min(Math.max(rawIdle, 30_000), 30 * 60 * 1000)
+    : 5 * 60 * 1000;
   const token = crypto.randomBytes(16).toString("hex");
   const startedAt = Date.now();
 

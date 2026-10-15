@@ -42,19 +42,28 @@ function asRecord(value: unknown): Record<string, unknown> {
 function openBrowserBestEffort(url: string): boolean {
   try {
     const spawned = (globalThis as Record<string, unknown>).Bun as
-      | { spawn?: (args: string[], opts?: unknown) => unknown }
+      | {
+          spawn?: (args: string[], opts?: unknown) => unknown;
+          spawnSync?: unknown;
+        }
       | undefined;
     if (spawned && typeof spawned.spawn === "function") {
-      if (process.platform === "win32") {
-        spawned.spawn(["cmd", "/c", "start", "", url], {
-          stdio: ["ignore", "ignore", "ignore"],
-        });
-      } else if (process.platform === "darwin") {
-        spawned.spawn(["open", url], { stdio: ["ignore", "ignore", "ignore"] });
-      } else {
-        spawned.spawn(["xdg-open", url], {
-          stdio: ["ignore", "ignore", "ignore"],
-        });
+      try {
+        const proc = spawned.spawn(
+          process.platform === "win32"
+            ? ["cmd", "/c", "start", "", url]
+            : process.platform === "darwin"
+              ? ["open", url]
+              : ["xdg-open", url],
+          {
+            stdio: ["ignore", "ignore", "ignore"],
+          },
+        ) as unknown as { unref?: unknown; on?: unknown };
+        if (proc && typeof proc.unref === "function") {
+          (proc as { unref: () => void }).unref();
+        }
+      } catch {
+        return false;
       }
       return true;
     }
@@ -62,21 +71,30 @@ function openBrowserBestEffort(url: string): boolean {
     // fall through to child_process
   }
   try {
-    void import("node:child_process").then(({ spawn }) => {
-      const args =
-        process.platform === "win32"
-          ? ["cmd", "/c", "start", "", url]
-          : process.platform === "darwin"
-            ? ["open", url]
-            : ["xdg-open", url];
-      const [cmd, ...rest] = args;
-      const child = spawn(cmd, rest, {
-        detached: true,
-        stdio: "ignore",
-        windowsHide: true,
-      });
-      child.unref();
-    });
+    // A floating promise with no rejection handler can take the server down
+    // as an unhandled rejection — the .catch + in-callback guards close it.
+    void import("node:child_process")
+      .then(({ spawn }) => {
+        try {
+          const args =
+            process.platform === "win32"
+              ? ["cmd", "/c", "start", "", url]
+              : process.platform === "darwin"
+                ? ["open", url]
+                : ["xdg-open", url];
+          const [cmd, ...rest] = args;
+          const child = spawn(cmd, rest, {
+            detached: true,
+            stdio: "ignore",
+            windowsHide: true,
+          });
+          child.on("error", () => {});
+          child.unref();
+        } catch {
+          // best-effort only
+        }
+      })
+      .catch(() => {});
     return true;
   } catch {
     return false;
@@ -87,13 +105,15 @@ export default Plugin.define({
   id: "context-segments",
   async setup(ctx: any) {
     const options = (ctx.options ?? {}) as Record<string, unknown>;
-    const warnAt =
-      typeof options.warnAt === "number" ? options.warnAt : 0.7;
-    const criticalAt =
-      typeof options.criticalAt === "number" ? options.criticalAt : 0.9;
+    const numOpt = (value: unknown, fallback: number): number =>
+      typeof value === "number" && Number.isFinite(value) && value >= 0
+        ? value
+        : fallback;
+    const warnAt = numOpt(options.warnAt, 0.7);
+    // criticalAt below warnAt would invert the warn/critical bands — clamp.
+    const criticalAt = Math.max(warnAt, numOpt(options.criticalAt, 0.9));
     const skillTracking = options.skillTracking !== false;
-    const webIdleMs =
-      typeof options.webIdleMs === "number" ? options.webIdleMs : 5 * 60 * 1000;
+    const webIdleMs = numOpt(options.webIdleMs, 5 * 60 * 1000);
 
     const log = async (message: string, extra?: unknown) => {
       try {
@@ -180,31 +200,133 @@ export default Plugin.define({
       }
     };
 
+    // --- Tool classifier (registry first, heuristics fallback) ------------
+    // MCP server names + tool ids come from the live registries so MCP
+    // attribution is exact. Reads are cached for 30s and never throw:
+    // on any failure summarize() falls back to pure name heuristics.
+    let classifierCache: {
+      at: number;
+      servers: string[];
+      tools: string[];
+    } | null = null;
+    const extractNames = (value: unknown): string[] => {
+      const out: string[] = [];
+      const push = (v: unknown) => {
+        if (typeof v === "string" && v) out.push(v);
+      };
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (typeof item === "string") push(item);
+          else if (Array.isArray(item)) push(item[0]);
+          else if (item && typeof item === "object") {
+            const r = item as Record<string, unknown>;
+            push(r.id ?? r.name ?? r.server ?? r.serverName);
+          }
+        }
+      } else if (value && typeof value === "object") {
+        for (const key of Object.keys(value as Record<string, unknown>)) {
+          push(key);
+        }
+      }
+      return [...new Set(out)];
+    };
+    const getToolClassifier = async (): Promise<{
+      mcpServers: string[];
+      mcpTools: string[];
+    }> => {
+      if (classifierCache && Date.now() - classifierCache.at < 30_000) {
+        return {
+          mcpServers: classifierCache.servers,
+          mcpTools: classifierCache.tools,
+        };
+      }
+      let servers: string[] = classifierCache?.servers ?? [];
+      let tools: string[] = classifierCache?.tools ?? [];
+      try {
+        const mcpList = await ctx.mcp.list();
+        const mcpServers = extractNames(
+          Array.isArray(mcpList)
+            ? mcpList
+            : asRecord(mcpList).servers ?? asRecord(mcpList).data ?? mcpList,
+        );
+        const toolList = await ctx.tool.list();
+        const toolIds = extractNames(
+          Array.isArray(toolList)
+            ? toolList
+            : asRecord(toolList).tools ?? asRecord(toolList).data ?? toolList,
+        );
+        const norm = (s: string) =>
+          s.trim().toLowerCase().replace(/[.-]/g, "_");
+        const serverSet = new Set(mcpServers.map(norm));
+        const mcpTools = toolIds.filter((id) => {
+          const nid = norm(id);
+          for (const s of serverSet) {
+            if (nid === s || nid.startsWith(`${s}_`)) return true;
+          }
+          return false;
+        });
+        servers = mcpServers;
+        tools = mcpTools;
+        classifierCache = { at: Date.now(), servers, tools };
+      } catch {
+        // keep last-known (or empty) classifier; heuristics take over
+      }
+      return { mcpServers: servers, mcpTools: tools };
+    };
+
     const buildSummary = async (sessionID: string) => {
       const session = await ctx.session.get({ sessionID });
       const sessionRecord = asRecord(session);
       const messages = await ctx.session.context({ sessionID });
       const list = Array.isArray(messages) ? messages : [];
       const { limit, label } = await resolveLimit(sessionRecord.model);
+      const classifier = await getToolClassifier();
 
       // One-time backfill: fold this session's skill messages into the
       // global counters so stats survive restarts and missed events.
+      // Batched into a single storage read + write (the old per-message
+      // get/set round-trips stalled the first summary of long sessions).
       if (skillTracking) {
         try {
           const flag = await ctx.storage.get(backfillKey(sessionID));
           if (!flag) {
+            const agg = new Map<string, { count: number; tokens: number }>();
             for (const raw of list) {
               const msg = asRecord(raw);
-              if (msg.type === "skill") {
-                await recordSkill(
-                  sessionID,
-                  String(msg.skill ?? msg.name ?? "skill"),
-                  String(msg.name ?? msg.skill ?? "skill"),
-                  msg.text,
-                );
+              if (msg.type !== "skill") continue;
+              const key = String(msg.name ?? msg.skill ?? "skill");
+              const entry = agg.get(key) ?? { count: 0, tokens: 0 };
+              entry.count += 1;
+              entry.tokens += estimateTokens(msg.text);
+              agg.set(key, entry);
+            }
+            if (agg.size > 0) {
+              const store = await readGlobal();
+              for (const [key, total] of agg) {
+                const entry = store.skills[key] ?? {
+                  id: key,
+                  name: key,
+                  count: 0,
+                  lastUsed: 0,
+                  estTokens: 0,
+                };
+                entry.count += total.count;
+                entry.lastUsed = Date.now();
+                entry.estTokens += total.tokens;
+                store.skills[key] = entry;
+              }
+              store.updated = Date.now();
+              try {
+                await ctx.storage.set(GLOBAL_KEY, store);
+              } catch {
+                // persistence is best-effort
               }
             }
-            await ctx.storage.set(backfillKey(sessionID), { at: Date.now() });
+            try {
+              await ctx.storage.set(backfillKey(sessionID), { at: Date.now() });
+            } catch {
+              // persistence is best-effort
+            }
           }
         } catch {
           // backfill is best-effort
@@ -219,6 +341,7 @@ export default Plugin.define({
           sessionTokens: sessionRecord.tokens,
           warnAt,
           criticalAt,
+          classifier,
         }),
       };
     };
@@ -246,6 +369,44 @@ export default Plugin.define({
     };
 
     // --- RPC (consumed by the TUI) -------------------------------------
+    // Shared dashboard starter: concurrent callers share one in-flight
+    // start instead of racing to bind two servers (the loser used to leak
+    // a server + timer that nothing could stop).
+    let dashboardStarting: Promise<{ url: string; opened: boolean }> | null =
+      null;
+    const dashboardCallbacks = () => ({
+      idleMs: webIdleMs,
+      openBrowser: openBrowserBestEffort,
+      getData: async (sid?: string) => ({
+        summary: sid
+          ? await buildSummary(sid).catch((error) => ({
+              ok: false as const,
+              error: error instanceof Error ? error.message : String(error),
+            }))
+          : null,
+        skills: await buildSkills().catch(() => ({
+          ok: false as const,
+          error: "unavailable",
+        })),
+        generatedAt: Date.now(),
+      }),
+    });
+    const ensureDashboard = (): Promise<{ url: string; opened: boolean }> => {
+      const running = dashboardRunning();
+      if (running) return Promise.resolve({ url: running.url, opened: false });
+      if (!dashboardStarting) {
+        dashboardStarting = startDashboard(dashboardCallbacks())
+          .then((handle) => {
+            // log() never throws; floating it keeps startup latency down.
+            void log("dashboard started", { port: handle.port });
+            return { url: handle.url, opened: true };
+          })
+          .finally(() => {
+            dashboardStarting = null;
+          });
+      }
+      return dashboardStarting;
+    };
     let emitStats: ((sessionID: string, skill: string) => Promise<void>) | null =
       null;
     try {
@@ -276,27 +437,7 @@ export default Plugin.define({
         },
         startWeb: async () => {
           try {
-            const running = dashboardRunning();
-            if (running) return { ok: true as const, url: running.url, opened: false };
-            const handle = await startDashboard({
-              idleMs: webIdleMs,
-              openBrowser: openBrowserBestEffort,
-              getData: async (sid?: string) => ({
-                summary: sid
-                  ? await buildSummary(sid).catch((error) => ({
-                      ok: false as const,
-                      error: error instanceof Error ? error.message : String(error),
-                    }))
-                  : null,
-                skills: await buildSkills().catch(() => ({
-                  ok: false as const,
-                  error: "unavailable",
-                })),
-                generatedAt: Date.now(),
-              }),
-            });
-            await log("dashboard started", { port: handle.port });
-            return { ok: true as const, url: handle.url, opened: true };
+            return { ok: true as const, ...(await ensureDashboard()) };
           } catch (error) {
             return {
               ok: false as const,
@@ -358,7 +499,7 @@ export default Plugin.define({
         editor.add({
           name: "context_usage",
           description:
-            "Show the colorized context-segment breakdown for a session: token usage per segment (system, skills, history, tools, assistant, reasoning) as a share of the model's context limit, plus top tools and skills. When this tool is called, summarize the key insights instead of pasting the raw output.",
+            "Show the colorized context-segment breakdown for a session: token usage per segment (system, skills, history, mcps, rules, others, assistant, reasoning) as a share of the model's context limit, plus top tools and skills. When this tool is called, summarize the key insights instead of pasting the raw output.",
           input: {
             type: "object",
             properties: { sessionID: { type: "string" } },
@@ -366,12 +507,20 @@ export default Plugin.define({
           },
           output: { type: "string" },
           execute: async (input: unknown, toolCtx: any) => {
-            const arg = asRecord(input).sessionID;
-            const sessionID =
-              (typeof arg === "string" && arg) || toolCtx?.sessionID;
-            if (!sessionID) throw new Error("No session ID available.");
-            const text = renderSummaryText(await buildSummary(String(sessionID)));
-            return { output: text };
+            // Never throw: a throwing tool executor fails the whole model
+            // turn, so degradation is returned as text instead.
+            try {
+              const arg = asRecord(input).sessionID;
+              const sessionID =
+                (typeof arg === "string" && arg) || toolCtx?.sessionID;
+              if (!sessionID) return { output: "Context unavailable: no session ID." };
+              const text = renderSummaryText(await buildSummary(String(sessionID)));
+              return { output: text };
+            } catch (error) {
+              return {
+                output: `Context unavailable: ${error instanceof Error ? error.message : String(error)}`,
+              };
+            }
           },
         });
         editor.add({
@@ -381,8 +530,14 @@ export default Plugin.define({
           input: { type: "object", properties: {}, additionalProperties: false },
           output: { type: "string" },
           execute: async () => {
-            const result = await buildSkills();
-            return { output: renderSkillsText(result.skills) };
+            try {
+              const result = await buildSkills();
+              return { output: renderSkillsText(result.skills) };
+            } catch (error) {
+              return {
+                output: `Skill stats unavailable: ${error instanceof Error ? error.message : String(error)}`,
+              };
+            }
           },
         });
       });
@@ -399,10 +554,19 @@ export default Plugin.define({
           name: "context",
           description: "Post this session's context-segment breakdown.",
           execute: async (input: any) => {
-            const text = renderSummaryText(
-              await buildSummary(input.sessionID),
-            );
-            await ctx.session.synthetic({ sessionID: input.sessionID, text });
+            // Never throw: post the degradation as text instead of failing
+            // the turn that invoked the command.
+            let text: string;
+            try {
+              text = renderSummaryText(await buildSummary(input.sessionID));
+            } catch (error) {
+              text = `Context unavailable: ${error instanceof Error ? error.message : String(error)}`;
+            }
+            try {
+              await ctx.session.synthetic({ sessionID: input.sessionID, text });
+            } catch {
+              // posting must never break the command
+            }
           },
         });
         editor.add({
@@ -413,39 +577,40 @@ export default Plugin.define({
             const rawText =
               typeof input?.prompt?.text === "string" ? input.prompt.text : "";
             if (/\bweb\b/i.test(rawText)) {
-              const started = dashboardRunning()
-                ? { ok: true as const, url: dashboardRunning()!.url }
-                : await (async () => {
-                    const handle = await startDashboard({
-                      idleMs: webIdleMs,
-                      openBrowser: openBrowserBestEffort,
-                      getData: async (sid?: string) => ({
-                        summary: sid
-                          ? await buildSummary(sid).catch((error) => ({
-                              ok: false as const,
-                              error:
-                                error instanceof Error
-                                  ? error.message
-                                  : String(error),
-                            }))
-                          : null,
-                        skills: await buildSkills(),
-                        generatedAt: Date.now(),
-                      }),
-                    });
-                    return { ok: true as const, url: handle.url };
-                  })();
-              await ctx.session.synthetic({
-                sessionID: input.sessionID,
-                text: `Skill dashboard: ${started.url}\nLoopback-only. Closing the tab stops the server automatically.`,
-              });
+              let text: string;
+              try {
+                const started = await ensureDashboard();
+                text =
+                  `Skill dashboard: ${started.url}\n` +
+                  `Loopback-only. Closing the tab stops the server automatically.`;
+              } catch (error) {
+                text = `Could not start skill dashboard: ${error instanceof Error ? error.message : String(error)}`;
+              }
+              try {
+                await ctx.session.synthetic({
+                  sessionID: input.sessionID,
+                  text,
+                });
+              } catch {
+                // posting must never break the command
+              }
               return;
             }
-            const result = await buildSkills();
-            await ctx.session.synthetic({
-              sessionID: input.sessionID,
-              text: renderSkillsText(result.skills),
-            });
+            let text: string;
+            try {
+              const result = await buildSkills();
+              text = renderSkillsText(result.skills);
+            } catch (error) {
+              text = `Skill stats unavailable: ${error instanceof Error ? error.message : String(error)}`;
+            }
+            try {
+              await ctx.session.synthetic({
+                sessionID: input.sessionID,
+                text,
+              });
+            } catch {
+              // posting must never break the command
+            }
           },
         });
       });

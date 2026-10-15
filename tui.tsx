@@ -40,6 +40,16 @@ interface SegmentDatum {
   pctOfUsed: number;
 }
 
+interface ToolRow {
+  name: string;
+  tokens: number;
+  calls: number;
+  /** Tool source bucket; absent on summaries from older servers. */
+  category?: string;
+}
+
+type ToolCategory = "skills" | "mcps" | "rules" | "others";
+
 interface Summary {
   ok?: boolean;
   error?: string;
@@ -48,8 +58,22 @@ interface Summary {
   used: number;
   pct: number | null;
   segments: SegmentDatum[];
-  topTools: { name: string; tokens: number; calls: number }[];
+  topTools: ToolRow[];
   topSkills: { id: string; name: string; tokens: number; count: number }[];
+  /** Per-category tool leaders; absent on summaries from older servers. */
+  topByCategory?: Record<ToolCategory, ToolRow[]>;
+  /** Token/call totals per tool category. */
+  toolTotals?: Record<ToolCategory, { tokens: number; calls: number }>;
+  /** Heaviest individual loads; absent on summaries from older servers. */
+  topDetails?: {
+    name: string;
+    label: string;
+    tokens: number;
+    calls: number;
+    category?: string;
+  }[];
+  /** Whether MCP attribution used the live registry or name heuristics. */
+  classifierSource?: "registry" | "heuristic";
   counts: { messages: number; steps: number };
   warn: { level: string; text: string } | null;
   estimated: boolean;
@@ -243,6 +267,30 @@ function useSummary(sessionID: () => string | undefined) {
     const sid = sessionID();
     if (sid) load(sid);
   };
+  // Trailing debounce for event-driven refreshes: step/skill events can
+  // burst during multi-step turns, and each refresh walks the full
+  // transcript plus an RPC round-trip. Session switches and manual
+  // retries below still load immediately.
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  const schedule = (sid: string) => {
+    try {
+      if (refreshTimer) clearTimeout(refreshTimer);
+    } catch {
+      // ignore
+    }
+    refreshTimer = setTimeout(() => {
+      refreshTimer = undefined;
+      load(sid);
+    }, 300);
+  };
+  onCleanup(() => {
+    try {
+      if (refreshTimer) clearTimeout(refreshTimer);
+    } catch {
+      // ignore
+    }
+    refreshTimer = undefined;
+  });
   createEffect(() => {
     const sid = sessionID();
     if (!sid) {
@@ -258,14 +306,26 @@ function useSummary(sessionID: () => string | undefined) {
     const sid = sessionID();
     if (!sid) return;
     const bump = (got: string) => {
-      if (got === sid) load(sid);
+      if (got === sid) schedule(sid);
     };
-    const offs = [
-      ctx.data.on("session.step.ended", (e) => bump(e.data.sessionID)),
-      ctx.data.on("session.skill.activated", (e) => bump(e.data.sessionID)),
-    ];
+    // An unknown event name (host drift) must not take the component down.
+    let offs: (() => void)[] = [];
+    try {
+      offs = [
+        ctx.data.on("session.step.ended", (e) => bump(e.data.sessionID)),
+        ctx.data.on("session.skill.activated", (e) => bump(e.data.sessionID)),
+      ];
+    } catch {
+      offs = [];
+    }
     onCleanup(() => {
-      for (const off of offs) off();
+      for (const off of offs) {
+        try {
+          off();
+        } catch {
+          // ignore
+        }
+      }
     });
   });
   return { data, loading, failed, retry } as const;
@@ -420,14 +480,23 @@ function DetailBody(props: { summary: Summary; onClose?: () => void }) {
       <BarLine summary={s()} width={28} />
       <SegmentDetails summary={s()} />
       <Show when={s().topTools.length > 0}>
-        <text fg={theme.text?.base as never}>Top tools</text>
+        <text fg={theme.text?.base as never}>
+          {`Top tools${s().classifierSource === "registry" ? " (registry-classified)" : s().classifierSource === "heuristic" ? " (name-heuristic; registry unavailable)" : ""}`}
+        </text>
         <For each={s().topTools}>
           {(tool) => (
             <text fg={theme.text?.muted as never}>
-              {`${tool.name}: ${formatNumber(tool.tokens)} tokens, ${tool.calls} calls`}
+              {`${tool.name}${tool.category ? ` [${tool.category}]` : ""}: ${formatNumber(tool.tokens)} tokens, ${tool.calls} calls`}
             </text>
           )}
         </For>
+      </Show>
+      <Show when={s().toolTotals} fallback={null}>
+        {(totals) => (
+          <text fg={theme.text?.muted as never}>
+            {`Tools by source: ${(Object.keys(totals()) as ToolCategory[]).map((cat) => `${cat} ${formatNumber(totals()[cat].tokens)}/${totals()[cat].calls} calls`).join(" · ")}`}
+          </text>
+        )}
       </Show>
       <Show when={s().topSkills.length > 0}>
         <text fg={theme.text?.base as never}>Skills this session</text>
@@ -435,6 +504,16 @@ function DetailBody(props: { summary: Summary; onClose?: () => void }) {
           {(skill) => (
             <text fg={theme.text?.muted as never}>
               {`${skill.name}: ${formatNumber(skill.tokens)} tokens, ${skill.count}x`}
+            </text>
+          )}
+        </For>
+      </Show>
+      <Show when={(s().topDetails ?? []).length > 0}>
+        <text fg={theme.text?.base as never}>Loaded details</text>
+        <For each={s().topDetails ?? []}>
+          {(d) => (
+            <text fg={theme.text?.muted as never}>
+              {`${d.name}${d.category ? ` [${d.category}]` : ""} ${d.label}: ${formatNumber(d.tokens)} tokens, ${d.calls} calls`}
             </text>
           )}
         </For>
@@ -640,36 +719,39 @@ export default Plugin.define({
     flag[LOAD_FLAG] = true;
 
     const disposables: (() => void)[] = [];
+    // One bad slot/keymap registration must not fail setup (which would
+    // unload the whole TUI plugin) — degrade to fewer contributions instead.
+    const safeSlot = (def: any) => {
+      try {
+        disposables.push(context.ui.slot(def));
+      } catch {
+        // ignore: that contribution stays unavailable
+      }
+    };
     const rpc = (context.client as unknown as Record<string, unknown>)
       .rpc as
       | ((def: unknown) => Record<string, (args?: unknown) => Promise<unknown>>)
       | undefined;
     const call = rpc ? rpc(csegDef) : null;
 
-    disposables.push(
-      context.ui.slot({
+    safeSlot({
         append: "prompt.footer.status",
         render: (input) => (
           <FooterHost sessionID={input.sessionID} showDetails={input.showDetails} />
         ),
-      }),
-    );
-    disposables.push(
-      context.ui.slot({
+    });
+    safeSlot({
         append: "sidebar.content",
         render: (input) => <SidebarHost sessionID={input.sessionID} />,
-      }),
-    );
-    disposables.push(
-      context.ui.slot({
+    });
+    safeSlot({
         append: "session.panel",
         render: (panel) => (
           <Show when={panel.name === "cseg.detail"} fallback={null}>
             <DetailPanel sessionID={panel.sessionID} onClose={panel.close} />
           </Show>
         ),
-      }),
-    );
+    });
 
     const openDetail = () => {
       const sid = currentSessionID(context);
@@ -690,7 +772,7 @@ export default Plugin.define({
       }
     };
 
-    const openSkills = async (input?: string) => {
+    const openSkillsInner = async (input?: string) => {
       if (!call) {
         context.ui.toast.show({
           title: "Context segments",
@@ -786,7 +868,26 @@ export default Plugin.define({
       else if (choice === "tui") await showTable();
     };
 
-    context.keymap.layer(() => ({
+    // Never-reject wrapper: `run` invokes this as `void openSkills(input)`,
+    // so a rejection would surface as an unhandled error in the TUI.
+    const openSkills = async (input?: string) => {
+      try {
+        await openSkillsInner(input);
+      } catch (error) {
+        try {
+          context.ui.toast.show({
+            title: "Context segments",
+            message: error instanceof Error ? error.message : String(error),
+            variant: "error",
+          });
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    try {
+      context.keymap.layer(() => ({
       mode: "global",
       commands: [
         {
@@ -807,7 +908,10 @@ export default Plugin.define({
         },
       ],
       bindings: ["cseg.details", "cseg.skills"],
-    }));
+      }));
+    } catch {
+      // palette/slash commands stay unavailable; the slots above still work
+    }
 
     return () => {
       for (const dispose of disposables) {
@@ -816,6 +920,13 @@ export default Plugin.define({
         } catch {
           // ignore
         }
+      }
+      // Allow re-registration after a plugin reload. Without this the bar
+      // silently never comes back until the whole TUI restarts.
+      try {
+        flag[LOAD_FLAG] = false;
+      } catch {
+        // ignore
       }
     };
   },
