@@ -17,6 +17,7 @@ import {
   For,
   Show,
   createEffect,
+  createMemo,
   createSignal,
   onCleanup,
 } from "solid-js";
@@ -327,21 +328,29 @@ function BarLine(props: {
   const ctx = usePlugin();
   const theme = themeOf(ctx);
   const width = props.width ?? 20;
-  const label = pctLabel(props.summary);
-  const colors = paletteFor(props.summary);
+  // Reactive: the component body runs once, so eager reads of props here
+  // would freeze the bar on the first summary while the header/details
+  // (reactive JSX positions) keep updating. Memos re-run when the summary
+  // (or hover state) changes, keeping the bar in sync.
+  const label = createMemo(() => pctLabel(props.summary));
+  const colors = createMemo(() => paletteFor(props.summary));
   // Merge adjacent same-color cells into single runs. The host puts gaps
   // between sibling elements, which is what split per-cell text apart.
-  const runs: { text: string; fg: unknown }[] = [];
-  for (const cell of cellsFor(props.summary, width)) {
-    const base =
-      cell.key === "__free" || cell.key === "__buffer"
-        ? FREE
-        : (colors.get(cell.key) ?? FREE);
-    const fg = props.hot ? lighten(base) : base;
-    const last = runs[runs.length - 1];
-    if (last && last.fg === fg) last.text += cell.ch;
-    else runs.push({ text: cell.ch, fg });
-  }
+  const runs = createMemo<{ text: string; fg: unknown }[]>(() => {
+    const hot = props.hot;
+    const list: { text: string; fg: unknown }[] = [];
+    for (const cell of cellsFor(props.summary, width)) {
+      const base =
+        cell.key === "__free" || cell.key === "__buffer"
+          ? FREE
+          : (colors().get(cell.key) ?? FREE);
+      const fg = hot ? lighten(base) : base;
+      const last = list[list.length - 1];
+      if (last && last.fg === fg) last.text += cell.ch;
+      else list.push({ text: cell.ch, fg });
+    }
+    return list;
+  });
   return (
     <box
       flexDirection="row"
@@ -355,10 +364,10 @@ function BarLine(props: {
         props.onHover?.(false);
       }}
     >
-      <For each={runs}>
+      <For each={runs()}>
         {(run) => <text fg={run.fg as never}>{run.text}</text>}
       </For>
-      <text fg={levelColor(theme, label.level) as never}>{` ${label.text}`}</text>
+      <text fg={levelColor(theme, label().level) as never}>{` ${label().text}`}</text>
     </box>
   );
 }
@@ -369,12 +378,12 @@ function BarLine(props: {
 function SegmentDetails(props: { summary: Summary; hot?: boolean }) {
   const ctx = usePlugin();
   const theme = themeOf(ctx);
-  const colors = paletteFor(props.summary);
+  const colors = createMemo(() => paletteFor(props.summary));
   return (
     <For each={props.summary.segments.filter((seg) => seg.tokens > 0)}>
       {(seg) => (
         <box flexDirection="row">
-          <text fg={(colors.get(seg.key) ?? FREE) as never}>{"■ "}</text>
+          <text fg={(colors().get(seg.key) ?? FREE) as never}>{"■ "}</text>
           <text
             fg={(props.hot ? theme.text?.base : theme.text?.muted) as never}
           >
@@ -472,12 +481,16 @@ function FooterHost(props: { sessionID?: string; showDetails?: boolean }) {
       sum.retry();
       return;
     }
-    // Reuse the footer's already-loaded data: no second fetch, so the
-    // dialog can never get stuck on "Loading context…".
+    // Reuse the footer's already-loaded data as the fallback so the
+    // dialog can never get stuck on "Loading context…", but prefer the
+    // live signal when it renders so an open dialog tracks fresh loads.
     const snapshot = loaded;
     dialogOpen = true;
     ctx.ui.dialog.show(
-      () => <DetailBody summary={snapshot} onClose={closeDetails} />,
+      () => {
+        const live = sum.data();
+        return <DetailBody summary={live ?? snapshot} onClose={closeDetails} />;
+      },
       () => {
         dialogOpen = false;
       },
