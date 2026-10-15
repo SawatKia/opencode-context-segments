@@ -1,0 +1,11 @@
+{
+  "name": "opencode-context-segments",
+  "version": "1.0.0",
+  "description": "Global OpenCode plugin: colorized per-session context-usage bar plus token analysis and persistent skill-usage stats.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["opencode", "opencode-plugin", "context", "tokens", "tui"],
+  "peerDependencies": {
+    "@opencode/plugin": "*"
+  }
+}
