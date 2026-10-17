@@ -2,7 +2,7 @@
  * context-segments — index.ts (server entrypoint, auto-discovered).
  *
  * - RPC `context-segments`: getSummary / getSkills / startWeb / stopWeb
- *   (+ `stats` event) consumed by the TUI (`tui.tsx`).
+ *   / postSummary (+ `stats` event) consumed by the TUI (`tui.tsx`).
  * - Agent tools: `context_usage`, `skill_stats`.
  * - Slash commands: `/context`, `/context-skills` (append `web` for the
  *   loopback dashboard).
@@ -448,6 +448,29 @@ export default Plugin.define({
         stopWeb: async () => {
           const stopped = stopDashboard();
           return { ok: true as const, stopped };
+        },
+        postSummary: async (input: unknown) => {
+          // Posts the plain-text breakdown into the session as a synthetic
+          // message so the model can investigate it. Never throws: failures
+          // come back as { ok: false } like every other method here.
+          try {
+            const { sessionID } = asRecord(input) as { sessionID?: unknown };
+            if (typeof sessionID !== "string" || !sessionID) {
+              throw new Error("postSummary requires sessionID");
+            }
+            const text = renderSummaryText(await buildSummary(sessionID));
+            try {
+              await ctx.session.synthetic({ sessionID, text });
+            } catch {
+              // posting must never break the call
+            }
+            return { ok: true as const };
+          } catch (error) {
+            return {
+              ok: false as const,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
         },
       });
       emitStats = async (sessionID: string, skill: string) => {

@@ -41,6 +41,10 @@ export const csegRpc = {
       input: anyObject,
       output: anyObject,
     },
+    postSummary: {
+      input: sessionObject,
+      output: anyObject,
+    },
   },
   events: {
     stats: {

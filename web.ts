@@ -10,6 +10,11 @@
  *  - Auto-close: no heartbeat for >25s after the first one (tab closed),
  *    or never pinged within 90s (browser never opened), or idle timeout
  *    with zero requests, or explicit stop(), or plugin unload cleanup.
+ *
+ * XSS: every value from the server reaches the DOM through
+ * createElement + textContent (innerHTML is only ever used for the fixed,
+ * data-free `<td>` scaffolding). There is therefore no HTML-escaping helper
+ * and there never needs to be one — the previous `escapeHtml` was dead code.
  */
 
 import http from "node:http";
@@ -88,14 +93,6 @@ function unauthorized(res: http.ServerResponse): void {
   res.end("not found");
 }
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
 function pageHtml(token: string): string {
   return `<!doctype html>
 <html lang="en">
@@ -106,7 +103,7 @@ function pageHtml(token: string): string {
 <style>
 :root { color-scheme: dark; }
 body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #0b0d12; color: #d6dae3; margin: 0; padding: 24px; }
-main { max-width: 860px; margin: 0 auto; }
+main { max-width: 1120px; margin: 0 auto; }
 h1 { font-size: 18px; margin: 0 0 4px; }
 p.sub { color: #8b8fa3; font-size: 12px; margin: 0 0 20px; }
 section { background: #12151c; border: 1px solid #232838; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
@@ -115,11 +112,21 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: 
 .bar > div { height: 100%; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th { text-align: left; color: #8b8fa3; font-weight: normal; padding: 4px 8px 4px 0; border-bottom: 1px solid #232838; }
-td { padding: 5px 8px 5px 0; border-bottom: 1px solid #181c26; }
+td { padding: 5px 8px 5px 0; border-bottom: 1px solid #181c26; overflow-wrap: anywhere; word-break: break-word; }
 .dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 8px; vertical-align: baseline; }
 .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 13px; }
-.row .name { width: 110px; color: #aab0c0; }
-.row .pct { width: 64px; text-align: right; color: #8b8fa3; }
+.row .name { width: 110px; color: #aab0c0; flex-shrink: 0; }
+.row .pct { margin-left: auto; text-align: right; color: #8b8fa3; white-space: nowrap; }
+details.topic { border: 1px solid #232838; border-radius: 8px; margin: 8px 0; padding: 0; }
+details.topic > summary { cursor: pointer; padding: 10px 12px; font-size: 13px; list-style: none; overflow-wrap: anywhere; }
+details.topic > summary::-webkit-details-marker { display: none; }
+details.topic > summary::before { content: "▸ "; color: #8b8fa3; }
+details.topic[open] > summary::before { content: "▾ "; }
+details.topic .body { padding: 4px 12px 12px; font-size: 13px; color: #aab0c0; }
+details.topic .body .hint { color: #8b8fa3; font-size: 12px; margin: 0 0 8px; overflow-wrap: anywhere; }
+details.topic ul.contrib { margin: 8px 0 0 18px; padding: 0; }
+details.topic ul.contrib li { margin: 6px 0; overflow-wrap: anywhere; word-break: break-word; }
+details.topic ul.contrib .lbl { display: block; color: #8b8fa3; overflow-wrap: anywhere; word-break: break-word; white-space: normal; }
 .warn { color: #fbbf24; } .crit { color: #f87171; }
 .toolbar { display: flex; gap: 8px; margin-bottom: 20px; }
 input, button { font: inherit; font-size: 13px; }
@@ -140,15 +147,32 @@ footer { color: #5b6172; font-size: 11px; margin-top: 8px; }
 <section id="ctx" hidden>
 <h2>Session context</h2>
 <div class="bar" id="bar"></div>
+<p class="sub" id="compnote">Composition is a partition of used context — open a topic for contributors. Tool tokens are returned-output estimates, not window shares.</p>
+  <p class="sub" id="caveat"></p>
 <div id="segs"></div>
+<details class="topic" id="toolioall"><summary>Tool I/O (all tools)</summary><div class="body">
+<p class="hint">Every ranked tool row, unsliced. These are transcript-text estimates of <strong>returned output</strong> — deliberately NOT scaled to the context total and never summed against it. The segment bar above is a partition of used context (the composition); this list is tool-returned bytes on their own account. Conflating the two is what made earlier versions of this page lie.</p>
+<table><thead><tr><th>Tool</th><th>Source</th><th>~Returned</th><th>Calls</th></tr></thead><tbody id="tooliobody"></tbody></table>
+</div></details>
 <div id="warn"></div>
 </section>
 <section id="tools" hidden>
 <h2>Top tools <span id="clfsrc" style="text-transform:none"></span></h2>
-<table><thead><tr><th>Tool</th><th>Source</th><th>Tokens</th><th>Calls</th></tr></thead><tbody id="toolsbody"></tbody></table>
+<p class="sub">By returned output (estimates) — not shares of used context.</p>
+<details class="topic" id="toolsdet"><summary>Top tools</summary><div class="body">
+<table><thead><tr><th>Tool</th><th>Source</th><th>~Returned</th><th>Calls</th></tr></thead><tbody id="toolsbody"></tbody></table>
 <p class="sub" id="tooltotals"></p>
-<h2 style="margin-top:16px">Loaded details</h2>
-<table><thead><tr><th>Tool</th><th>What was loaded</th><th>Tokens</th><th>Calls</th></tr></thead><tbody id="detailsbody"></tbody></table>
+</div></details>
+<details class="topic" id="detailsdet"><summary>Loaded details (heaviest individual loads)</summary><div class="body">
+<table><thead><tr><th>Tool</th><th>What was loaded</th><th>~Tokens</th><th>Calls</th></tr></thead><tbody id="detailsbody"></tbody></table>
+</div></details>
+</section>
+<section id="sess" hidden>
+<h2>Session totals</h2>
+<details class="topic" id="sessdet" open><summary>Cumulative across requests — NOT current window</summary><div class="body">
+<p class="sub" id="sessbody"></p>
+<p class="sub" id="transcript"></p>
+</div></details>
 </section>
 <section>
 <h2>Skill usage (all sessions)</h2>
@@ -203,16 +227,78 @@ async function load() {
     div.style.background = seg.color;
     div.title = seg.label + ": " + fmt(seg.tokens) + " tokens";
     bar.appendChild(div);
-    const row = document.createElement("div");
-    row.className = "row";
-    const dot = seg.color;
-    const pct = summary.limit ? (seg.tokens / summary.limit * 100).toFixed(1) + "%" : "—";
-    row.innerHTML = '<span class="name"></span><span class="dot" style="background:' +
-      dot + '"></span><span></span><span class="pct"></span>';
-    row.children[0].textContent = seg.label;
-    row.children[2].textContent = fmt(seg.tokens) + " tokens";
-    row.children[3].textContent = pct;
-    segs.appendChild(row);
+    // Server-provided share. pctOfLimit is null when the model limit is
+    // unknown — render that as "unknown", never as 0%.
+    const pctW = (seg.pctOfLimit !== null && seg.pctOfLimit !== undefined) ? seg.pctOfLimit.toFixed(1) + "% of window" : "window share unknown";
+    const pctU = (seg.pctOfUsed !== null && seg.pctOfUsed !== undefined) ? seg.pctOfUsed.toFixed(1) + "% of used" : "share of used unknown";
+    const det = document.createElement("details");
+    det.className = "topic";
+    const sum = document.createElement("summary");
+    sum.textContent = seg.label + " " + pctW + " (" + pctU + ") (" + fmt(seg.tokens) + ")";
+    det.appendChild(sum);
+    const body = document.createElement("div");
+    body.className = "body";
+    // Server-side othersContributors and contributors["others"] are the
+    // same array; prefer the named field. It is deliberately NOT sliced to a
+    // top-N — "others" is the catch-all, so truncating it is how mass hides.
+    const rows = seg.key === "others" && summary.othersContributors
+      ? summary.othersContributors
+      : (summary.contributors && summary.contributors[seg.key]) || [];
+    if (rows.length === 0) {
+      const hint = document.createElement("p");
+      hint.className = "hint";
+      hint.textContent = seg.key === "unaccounted"
+        ? "Rounding + non-text residual inside the partition — not a consumer to optimize."
+        : "No per-item rows recorded.";
+      body.appendChild(hint);
+    } else {
+      const ul = document.createElement("ul");
+      ul.className = "contrib";
+      for (const r of rows) {
+        const li = document.createElement("li");
+        const trunc = r.truncatedCalls > 0 ? ", " + r.truncatedCalls + " truncated" : "";
+        const shareTxt = summary.used > 0 ? ((r.tokens / summary.used) * 100).toFixed(1) + "% of used" : "share n/a";
+        li.textContent = (r.name || "") + (r.category ? " [" + r.category + "]" : "") + ": ~" + fmt(r.tokens) + " returned (" + shareTxt + "), " + r.calls + " calls" + trunc + (r.method === "estimated" ? ", estimated" : "");
+        const lbl = document.createElement("span");
+        lbl.className = "lbl";
+        lbl.textContent = r.label || "";
+        li.appendChild(lbl);
+        ul.appendChild(li);
+      }
+      body.appendChild(ul);
+    }
+    det.appendChild(body);
+    segs.appendChild(det);
+  }
+  // The residual is a fact about the partition, so state it plainly instead of
+  // letting the segment row speak for itself. Only shown when non-zero.
+  const unacct = document.getElementById("caveat");
+  if (unacct) {
+    const notes = [];
+    if ((summary.unaccounted || 0) > 0) {
+      notes.push("unaccounted: " + fmt(summary.unaccounted) + " tokens (rounding + non-text parts inside the partition — not a consumer to optimize)");
+    }
+    unacct.textContent = notes.join(" · ");
+  }
+  const toolIO = summary.toolIO || [];
+  const toolIODet = document.getElementById("toolioall");
+  const toolIOBody = document.getElementById("tooliobody");
+  if (toolIODet) {
+    toolIODet.hidden = toolIO.length === 0;
+    toolIOBody.innerHTML = "";
+    if (toolIO.length === 0) {
+      toolIOBody.innerHTML = '<tr><td colspan="4">No tool calls recorded.</td></tr>';
+    }
+    // Every row, unsliced — toolIO is already ranked by returned bytes.
+    for (const t of toolIO) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = "<td></td><td></td><td></td><td></td>";
+      tr.children[0].textContent = t.name;
+      tr.children[1].textContent = t.category || "—";
+      tr.children[2].textContent = "~" + fmt(t.tokens) + " returned";
+      tr.children[3].textContent = t.calls + (t.truncatedCalls > 0 ? " (" + t.truncatedCalls + " truncated)" : "");
+      toolIOBody.appendChild(tr);
+    }
   }
   const toolsSec = document.getElementById("tools");
   const toolsBody = document.getElementById("toolsbody");
@@ -229,13 +315,13 @@ async function load() {
       tr.innerHTML = "<td></td><td></td><td></td><td></td>";
       tr.children[0].textContent = t.name;
       tr.children[1].textContent = t.category || "—";
-      tr.children[2].textContent = fmt(t.tokens);
-      tr.children[3].textContent = t.calls;
+      tr.children[2].textContent = "~" + fmt(t.tokens) + " returned";
+      tr.children[3].textContent = t.calls + (t.truncatedCalls > 0 ? " (" + t.truncatedCalls + " truncated)" : "");
       toolsBody.appendChild(tr);
     }
     const totals = summary.toolTotals || {};
-    document.getElementById("tooltotals").textContent = "By source: " +
-      Object.keys(totals).filter(function (k) { return totals[k].tokens > 0 || totals[k].calls > 0; }).map(function (k) { return k + " " + fmt(totals[k].tokens) + "/" + totals[k].calls + " calls"; }).join(" · ");
+    document.getElementById("tooltotals").textContent = "Tool output by source (returned, estimated): " +
+      Object.keys(totals).filter(function (k) { return totals[k].tokens > 0 || totals[k].calls > 0; }).map(function (k) { return k + " ~" + fmt(totals[k].tokens) + " returned/" + totals[k].calls + " calls"; }).join(" · ");
     const detailsBody = document.getElementById("detailsbody");
     detailsBody.innerHTML = "";
     const topDetails = summary.topDetails || [];
@@ -247,10 +333,36 @@ async function load() {
       tr.innerHTML = "<td></td><td></td><td></td><td></td>";
       tr.children[0].textContent = d.name + (d.category ? " [" + d.category + "]" : "");
       tr.children[1].textContent = d.label;
-      tr.children[2].textContent = fmt(d.tokens);
-      tr.children[3].textContent = d.calls;
+      tr.children[2].textContent = "~" + fmt(d.tokens);
+      tr.children[3].textContent = d.calls + (d.truncatedCalls > 0 ? " (" + d.truncatedCalls + " truncated)" : "");
       detailsBody.appendChild(tr);
     }
+  }
+  const sessSec = document.getElementById("sess");
+  if (summary.cumulative) {
+    sessSec.hidden = false;
+    const c = summary.cumulative;
+    document.getElementById("sessbody").textContent =
+      "Cumulative across requests — NOT current window" + (c.scope ? " (" + c.scope + ")" : "") +
+      ": in " + fmt(c.input) + ", out " + fmt(c.output) + ", reasoning " + fmt(c.reasoning) +
+      ", cache read/write " + fmt(c.cacheRead) + "/" + fmt(c.cacheWrite) +
+      ". Cache-read counts reused prefix tokens, not new context.";
+  } else { sessSec.hidden = true; }
+  const counts = summary.counts || {};
+  const tx = document.getElementById("transcript");
+  if (tx) {
+    tx.textContent = "Transcript: " + fmt(counts.messages || 0) + " messages (" +
+      fmt(counts.userMessages || 0) + " user, " + fmt(counts.assistantMessages || 0) + " assistant, " +
+      fmt(counts.systemMessages || 0) + " system, " + fmt(counts.syntheticMessages || 0) + " synthetic, " +
+      fmt(counts.compactionCount || 0) + " compaction, " + fmt(counts.ignoredMessages || 0) + " ignored)";
+    const skips = [];
+    if ((counts.excludedByCompaction || 0) > 0) {
+      skips.push(fmt(counts.excludedByCompaction) + " entries fenced out by compaction (replaced by the compaction summary + recent, so excluded from the composition)");
+    }
+    if ((summary.skippedParts || 0) > 0) {
+      skips.push(fmt(summary.skippedParts) + " non-text parts skipped (images/binary we cannot size — they occupy context and land in unaccounted)");
+    }
+    if (skips.length > 0) tx.textContent += " · " + skips.join(" · ");
   }
   const warn = document.getElementById("warn");
   warn.innerHTML = "";
@@ -261,9 +373,16 @@ async function load() {
     warn.appendChild(w);
   }
   const head = summary.limit && summary.pct !== null && summary.pct !== undefined
-    ? fmt(summary.used) + " / " + fmt(summary.limit) + " tokens (" + summary.pct.toFixed(1) + "%)"
+    ? fmt(summary.used) + " / " + fmt(summary.limit) + " tokens (" + summary.pct.toFixed(1) + "% of window)"
     : fmt(summary.used) + " tokens (limit unknown)";
-  document.getElementById("sub").textContent = head + " — " + summary.model;
+  const method = summary.context && summary.context.method
+    ? summary.context.method === "provider" ? "provider-anchored"
+      : summary.context.method === "estimate" ? "estimates" : "unattributed"
+    : (summary.estimated ? "estimates" : "provider-anchored");
+  const remaining = summary.context && summary.context.remaining !== null && summary.context.remaining !== undefined
+    ? ", " + fmt(summary.context.remaining) + " remaining" : "";
+  const stale = summary.context && summary.context.stale ? " [stale: newer turn reported no usage]" : "";
+  document.getElementById("sub").textContent = head + remaining + " [" + method + "]" + stale + " — " + summary.model;
 }
 document.getElementById("load").addEventListener("click", () => load().catch(() => {}));
 load().catch(() => {});
